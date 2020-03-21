@@ -25,7 +25,7 @@ name = "sccache"
 name = "sccache-dist"
 required-features = ["dist-server"]
 
-[[profile.release]]
+[profile.release]
 opt-level = 3
 lto = true
 
