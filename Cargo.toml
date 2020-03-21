@@ -22,7 +22,7 @@ name = "sccache-dist"
 required-features = ["dist-server"]
 
 [[profile.release]]
-opt.level = 3
+opt-level = 3
 lto = true
 
 [dependencies]
