@@ -21,9 +21,10 @@ use crate::compiler::{gcc, write_temp_file, Cacheable, CompileCommand, CompilerA
 use crate::dist;
 use crate::mock_command::{CommandCreator, CommandCreatorSync, RunCommand};
 use crate::util::{run_input_output, OsStrExt};
-use futures::future::{self, Future};
+use semver::Version;
 use std::ffi::OsString;
 use std::fs::File;
+use std::future::Future;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
@@ -35,14 +36,55 @@ use crate::errors::*;
 pub struct Clang {
     /// true iff this is clang++.
     pub clangplusplus: bool,
+    /// true iff this is Apple's clang(++).
+    pub is_appleclang: bool,
+    /// String from __VERSION__ macro.
+    pub version: Option<String>,
 }
 
+impl Clang {
+    fn is_minversion(&self, major: u64) -> bool {
+        // Apple clang follows its own versioning scheme.
+        if self.is_appleclang {
+            return false;
+        }
+
+        let version_val = match self.version.clone() {
+            Some(version_val) => version_val,
+            None => return false,
+        };
+
+        let version_str = match version_val.split(' ').find(|x| x.contains('.')) {
+            Some(version_str) => version_str,
+            None => return false,
+        };
+
+        let parsed_version = match Version::parse(version_str) {
+            Ok(parsed_version) => parsed_version,
+            Err(e) => return false,
+        };
+
+        parsed_version
+            >= (Version {
+                major,
+                minor: 0,
+                patch: 0,
+                pre: vec![],
+                build: vec![],
+            })
+    }
+}
+
+#[async_trait]
 impl CCompilerImpl for Clang {
     fn kind(&self) -> CCompilerKind {
         CCompilerKind::Clang
     }
     fn plusplus(&self) -> bool {
         self.clangplusplus
+    }
+    fn version(&self) -> Option<String> {
+        self.version.clone()
     }
     fn parse_arguments(
         &self,
@@ -54,10 +96,12 @@ impl CCompilerImpl for Clang {
             cwd,
             (&gcc::ARGS[..], &ARGS[..]),
             self.clangplusplus,
+            self.kind(),
         )
     }
 
-    fn preprocess<T>(
+    #[allow(clippy::too_many_arguments)]
+    async fn preprocess<T>(
         &self,
         creator: &T,
         executable: &Path,
@@ -66,10 +110,17 @@ impl CCompilerImpl for Clang {
         env_vars: &[(OsString, OsString)],
         may_dist: bool,
         rewrite_includes_only: bool,
-    ) -> SFuture<process::Output>
+    ) -> Result<process::Output>
     where
         T: CommandCreatorSync,
     {
+        let mut ignorable_whitespace_flags = vec!["-P".to_string()];
+
+        // Clang 14 and later support -fminimize-whitespace, which normalizes away non-semantic whitespace which in turn increases cache hit rate.
+        if self.is_minversion(14) {
+            ignorable_whitespace_flags.push("-fminimize-whitespace".to_string())
+        }
+
         gcc::preprocess(
             creator,
             executable,
@@ -79,7 +130,9 @@ impl CCompilerImpl for Clang {
             may_dist,
             self.kind(),
             rewrite_includes_only,
+            ignorable_whitespace_flags,
         )
+        .await
     }
 
     fn generate_compile_commands(
@@ -115,10 +168,14 @@ counted_array!(pub static ARGS: [ArgInfo<gcc::ArgData>; _] = [
     take_arg!("-fdebug-compilation-dir", OsString, Separated, PassThrough),
     flag!("-fmodules", TooHardFlag),
     flag!("-fno-color-diagnostics", NoDiagnosticsColorFlag),
+    flag!("-fno-profile-instr-generate", TooHardFlag),
+    flag!("-fno-profile-instr-use", TooHardFlag),
     take_arg!("-fplugin", PathBuf, CanBeConcatenated('='), ExtraHashFile),
     flag!("-fprofile-instr-generate", ProfileGenerate),
-    // Can be either -fprofile-instr-use or -fprofile-instr-use=path
-    take_arg!("-fprofile-instr-use", OsString, Concatenated, TooHard),
+    // Note: the PathBuf argument is optional
+    take_arg!("-fprofile-instr-use", PathBuf, Concatenated('='), ClangProfileUse),
+    // Note: this overrides the -fprofile-use option in gcc.rs.
+    take_arg!("-fprofile-use", PathBuf, Concatenated('='), ClangProfileUse),
     take_arg!("-fsanitize-blacklist", PathBuf, Concatenated('='), ExtraHashFile),
     take_arg!("-gcc-toolchain", OsString, Separated, PassThrough),
     take_arg!("-include-pch", PathBuf, CanBeSeparated, PreprocessorArgumentPath),
@@ -129,6 +186,27 @@ counted_array!(pub static ARGS: [ArgInfo<gcc::ArgData>; _] = [
     flag!("-verify", PreprocessorArgumentFlag),
 ]);
 
+// Maps the `-fprofile-use` argument to the actual path of the
+// .profdata file Clang will try to use.
+pub(crate) fn resolve_profile_use_path(arg: &Path, cwd: &Path) -> PathBuf {
+    // Note that `arg` might be empty (if no argument was given to
+    // -fprofile-use), in which case `path` will be `cwd` after
+    // the next statement and "./default.profdata" at the end of the
+    // block. This matches Clang's behavior for when no argument is
+    // given.
+    let mut path = cwd.join(arg);
+
+    assert!(!arg.as_os_str().is_empty() || path == cwd);
+
+    // Clang allows specifying a directory here, in which case it
+    // will look for the file `default.profdata` in that directory.
+    if path.is_dir() {
+        path.push("default.profdata");
+    }
+
+    path
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -136,14 +214,16 @@ mod test {
     use crate::compiler::*;
     use crate::mock_command::*;
     use crate::test::utils::*;
-    use futures::Future;
     use std::collections::HashMap;
+    use std::future::Future;
     use std::path::PathBuf;
 
     fn parse_arguments_(arguments: Vec<String>) -> CompilerArguments<ParsedArguments> {
         let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
         Clang {
             clangplusplus: false,
+            is_appleclang: false,
+            version: None,
         }
         .parse_arguments(&arguments, &std::env::current_dir().unwrap())
     }
@@ -402,5 +482,105 @@ mod test {
 
         let a = parses!("-c", "foo.c", "-o", "foo.o");
         assert_eq!(a.color_mode, ColorMode::Auto);
+    }
+
+    #[test]
+    fn test_parse_arguments_profile_instr_use() {
+        let a = parses!(
+            "-c",
+            "foo.c",
+            "-o",
+            "foo.o",
+            "-fprofile-instr-use=foo.profdata"
+        );
+        assert_eq!(ovec!["-fprofile-instr-use=foo.profdata"], a.common_args);
+        assert_eq!(
+            ovec![std::env::current_dir().unwrap().join("foo.profdata")],
+            a.extra_hash_files
+        );
+    }
+
+    #[test]
+    fn test_parse_arguments_profile_use() {
+        let a = parses!("-c", "foo.c", "-o", "foo.o", "-fprofile-use=xyz.profdata");
+
+        assert_eq!(ovec!["-fprofile-use=xyz.profdata"], a.common_args);
+        assert_eq!(
+            ovec![std::env::current_dir().unwrap().join("xyz.profdata")],
+            a.extra_hash_files
+        );
+    }
+
+    #[test]
+    fn test_parse_arguments_profile_use_with_directory() {
+        let a = parses!("-c", "foo.c", "-o", "foo.o", "-fprofile-use=.");
+
+        assert_eq!(ovec!["-fprofile-use=."], a.common_args);
+        assert_eq!(
+            ovec![std::env::current_dir().unwrap().join("default.profdata")],
+            a.extra_hash_files
+        );
+    }
+
+    #[test]
+    fn test_parse_arguments_profile_use_with_no_argument() {
+        let a = parses!("-c", "foo.c", "-o", "foo.o", "-fprofile-use");
+
+        assert_eq!(ovec!["-fprofile-use"], a.common_args);
+        assert_eq!(
+            ovec![std::env::current_dir().unwrap().join("default.profdata")],
+            a.extra_hash_files
+        );
+    }
+
+    #[test]
+    fn test_parse_arguments_pgo_cancellation() {
+        assert_eq!(
+            CompilerArguments::CannotCache("-fno-profile-use", None),
+            parse_arguments_(stringvec![
+                "-c",
+                "foo.c",
+                "-o",
+                "foo.o",
+                "-fprofile-use",
+                "-fno-profile-use"
+            ])
+        );
+
+        assert_eq!(
+            CompilerArguments::CannotCache("-fno-profile-instr-use", None),
+            parse_arguments_(stringvec![
+                "-c",
+                "foo.c",
+                "-o",
+                "foo.o",
+                "-fprofile-instr-use",
+                "-fno-profile-instr-use"
+            ])
+        );
+
+        assert_eq!(
+            CompilerArguments::CannotCache("-fno-profile-generate", None),
+            parse_arguments_(stringvec![
+                "-c",
+                "foo.c",
+                "-o",
+                "foo.o",
+                "-fprofile-generate",
+                "-fno-profile-generate"
+            ])
+        );
+
+        assert_eq!(
+            CompilerArguments::CannotCache("-fno-profile-instr-generate", None),
+            parse_arguments_(stringvec![
+                "-c",
+                "foo.c",
+                "-o",
+                "foo.o",
+                "-fprofile-instr-generate",
+                "-fno-profile-instr-generate"
+            ])
+        );
     }
 }
